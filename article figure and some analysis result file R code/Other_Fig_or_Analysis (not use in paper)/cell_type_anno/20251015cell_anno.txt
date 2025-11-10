@@ -1,0 +1,220 @@
+# 【结果，只有CD14 Mono亚群注释成功，其余都亚群注释失败】
+
+library(Seurat)
+library(dplyr)
+library(SeuratObject)
+library(writexl)
+library(data.table)
+
+setwd("/mnt/d/pbmc-equation/")
+
+
+########## 1 获取每个分支中每个细胞状态的标记基因 ##########
+topgene = list()
+n_top = 100000
+
+# cell_type = "CD14 Mono"
+# cell_type = "CD4 Naive"
+# cell_type = "CD8 Naive"
+# cell_type = "CD4 TCM"
+
+for (cell_type in c("CD14 Mono", "CD4 Naive", "CD8 Naive", "CD4 TCM")) {
+  interest_cell_type_Branches <- readRDS(paste0("./pr50 newest for paper/", cell_type, " result pr50/2.1 Data Processing - Pseudotime Analysis And Cell Branching Assignment/interest_cell_type_Branches.rds"))
+  scRNAseq <- readRDS("./scRNAseq.rds")
+  scRNAseq <- subset(scRNAseq, subset = seurat_annotations == cell_type)
+  
+  for (n in 1:length(interest_cell_type_Branches[[cell_type]])) {
+    scRNAseq@meta.data[[paste0("Branch", n)]] = "-"
+  }
+  
+  for (n in 1:length(interest_cell_type_Branches[[cell_type]])) {
+    for (cell in rownames(interest_cell_type_Branches[[cell_type]][[n]])) {
+      scRNAseq@meta.data[cell, paste0("Branch", n)] = interest_cell_type_Branches[[cell_type]][[n]][cell, "State"]
+    }
+  }
+  
+  scRNAseq@meta.data[["State"]] = "-"
+  for (cell in rownames(scRNAseq@meta.data)) {
+    a = unique(as.character(scRNAseq@meta.data[cell, paste0("Branch", 1:length(interest_cell_type_Branches[[cell_type]]))]))
+    a <- a[!a %in% c("-") & !is.na(a)]
+    scRNAseq@meta.data[cell, "State"] = a
+  }; rm(a)
+  
+  diff.wilcox = FindAllMarkers(scRNAseq, group.by = "State")
+  all.markers = diff.wilcox %>% dplyr::select(gene, everything()) %>% subset(p_val<0.05) %>% subset(p_val_adj<0.05) %>% subset(avg_log2FC>0)
+  all.markers$cluster <- factor(all.markers$cluster, levels = sort(unique(as.numeric(levels(all.markers$cluster)))))
+  topgene[[cell_type]] = all.markers %>% group_by(cluster) %>% top_n(n = n_top, wt = avg_log2FC) %>% arrange(cluster, desc(avg_log2FC))
+}; rm(diff.wilcox, all.markers)
+
+for (cell_type in names(topgene)) {
+  file_name <- paste0("./Results/2 branch/", gsub(" ", "_", cell_type), "_markers.xlsx")
+  write_xlsx(topgene[[cell_type]], path = file_name)
+}
+
+# scRNAseq <- NormalizeData(scRNAseq, normalization.method = "LogNormalize", scale.factor = 10000)
+# scRNAseq <- FindVariableFeatures(scRNAseq, selection.method = "vst", nfeatures = 2000)
+# scRNAseq <- ScaleData(scRNAseq,features = rownames(scRNAseq))
+# DoHeatmap(scRNAseq,                             #seurat对象(数据)
+#           features = topgene[[cell_type]]$gene,            #绘制的基因
+#           label = F,                        #图中是否添加label信息
+#           slot = "scale.data",              #绘图使用的表达矩阵
+#           group.by = 'State',     #分组名称
+#           group.bar = T)                    #是否展示bar
+
+
+########## 2 对每个细胞状态进行注释 ##########
+annodata = fread("./Results/2 branch/CELLxGENE_gene_expression_101525.csv")
+# table(annodata$`Cell Type`)
+
+markers_state = list()
+cell_subtype = list()
+markers_db = list()
+state_anno = list()
+
+# cell_type = "CD14 Mono"
+# cell_type = "CD4 Naive"
+# cell_type = "CD8 Naive"
+# cell_type = "CD4 TCM"
+
+for (cell_type in names(topgene)) {
+  ### 列举亚型
+  if (cell_type == "CD14 Mono") {
+    cell_subtype[[cell_type]] = c(
+      "CD14-positive monocyte",
+      # 【CD14阳性单核细胞】
+      # CD14阳性单核细胞包含人类单核细胞的三个亚群：【CD14阳性、CD16阴性】的经典单核细胞；【CD14阳性、CD16阳性】的中间型单核细胞；以及【CD14低、CD16阳性】的非经典单核细胞。
+      # 这些细胞从骨髓产生后进入血液，在免疫应答和炎症调节中扮演核心角色。
+      # 
+      # 【经典单核细胞】的主要功能是作为宿主防御感染的第一道防线。
+      # 它们准备好迁移至感染部位，并表达模式识别受体，以帮助识别和吞噬病原体，从而消灭这些病原体。
+      # 经典单核细胞还通过产生多种促炎细胞因子来参与炎症反应。
+      # 在感染或损伤等病理条件下，经典单核细胞会响应组织的特定信号离开血液，向受影响部位迁移。
+      # 到达后，这些细胞可分化为巨噬细胞和树突状细胞等多种细胞类型，以对抗特定病原体或损伤。
+      # 
+      # 【中间型单核细胞】在表型特征、功能能力和基因表达谱上兼具经典和非经典单核细胞的特。
+      # 它们像经典单核细胞一样高表达CD14，同时也表达CD16（类似于非经典单核细胞）。
+      # 与经典和非经典单核细胞相比，这类单核细胞释放的细胞因子通常较少，但产生的活性氧物种最多。
+      # 中间型单核细胞还能诱导T细胞增殖，并高表达主要组织相容性复合体分子用于抗原呈递。
+      # 它们似乎在炎症条件下也发挥作用，尽管其具体功能尚不完全清楚。
+      # 
+      # 【非经典单核细胞】负责巡逻血管内皮，并在感知到炎症或损伤时穿越内皮。
+      # 它们也通过吞噬作用参与清除受损细胞。
+      # 这个过程使细胞能够吞噬并消灭病原体、碎片和凋亡细胞。
+      # 在稳态条件下，这些单核细胞在维持血管完整性方面具有重要功能。
+      
+      "CD14-positive, CD16-negative classical monocyte", 
+      # 【CD14阳性、CD16阴性经典单核细胞】
+      # CD14阳性CD16阴性经典单核细胞是单核细胞的一个亚型，构成了人体免疫系统的关键组成部分。
+      # 这些细胞从骨髓产生后进入血液，在免疫应答和炎症调节中扮演核心角色。
+      # 它们在体内循环的单核细胞中占绝大多数，通常约占单核细胞总数的80-90%。
+      # 
+      # 这类经典单核细胞的主要功能是作为宿主防御感染的第一道防线。
+      # 它们准备好迁移至感染部位，并表达模式识别受体，以帮助识别和吞噬病原体，从而消灭这些病原体。
+      # 经典单核细胞还通过产生多种促炎细胞因子来参与炎症反应。
+      # 
+      # 在感染或损伤等病理条件下，经典单核细胞会响应组织的特定信号离开血液，向受影响部位迁移。
+      # 到达后，这些细胞可分化为巨噬细胞和树突状细胞等多种细胞类型，以对抗特定病原体或损伤。
+      # 单核细胞活动失调可能导致多种人类疾病的发生，包括炎症、感染、组织损伤和各种自身免疫性疾病。
+      
+      "CD14-positive, CD16-positive monocyte", 
+      # 【CD14阳性、CD16阳性单核细胞（中间型单核细胞）】
+      # 中间型单核细胞，也定义为CD14++CD16+单核细胞，是人类单核细胞的三个亚群之一（另外两个是经典单核细胞和非经典单核细胞）。
+      # 这些细胞在免疫系统的生理功能中扮演关键角色，尤其对于人体应对炎症和感染至关重要。
+      # 凭借其多样化的功能，中间型单核细胞通过连接经典和非经典单核细胞亚群，独特地增强了免疫反应的效力。
+      # 
+      # 在表型特征、功能能力和基因表达谱方面，中间型单核细胞表现出另外两个亚群功能的结合。
+      # 它们像经典单核细胞一样高表达CD14，同时也像非经典单核细胞那样表达CD16。
+      # 与经典和非经典单核细胞相比，这类细胞通常释放的细胞因子较少，但产生的反应性氧物种最多。
+      # 中间型单核细胞还能诱导T细胞增殖，并高表达主要组织相容性复合体分子用于抗原呈递，这在启动适应性免疫反应中至关重要。
+      # 
+      # 在严重炎症和感染情况下，血液中中间型单核细胞的相对数量会增加，尽管它们在这些过程中的具体作用尚未完全明确。
+      # 此外，一些研究报告了将中间型和非经典单核细胞作为一个混合群体进行研究的发现，这使得精确界定中间型单核细胞的独特功能变得更为复杂。
+      
+      "CD14-low, CD16-positive monocyte"
+    )
+  } else if (cell_type == "CD4 Naive") {
+    cell_subtype[[cell_type]] = grep("T cell", unique(annodata[["Cell Type"]]), value = TRUE)
+  } else if  (cell_type == "CD8 Naive") {
+    cell_subtype[[cell_type]] = grep("T cell", unique(annodata[["Cell Type"]]), value = TRUE)
+  } else if  (cell_type == "CD4 TCM") {
+    cell_subtype[[cell_type]] = grep("T cell", unique(annodata[["Cell Type"]]), value = TRUE)
+  }
+  
+  ### 获取用于亚型注释的标记基因数据库
+  markers_db[[cell_type]] = list()
+  for (subtype in cell_subtype[[cell_type]]) {
+    markers_db[[cell_type]][[subtype]] = annodata[annodata$`Cell Type` == subtype, ]
+  }
+  
+  ### 获取各细胞状态（待注释亚型）的标记基因
+  markers_state[[cell_type]] <- split(topgene[[cell_type]], topgene[[cell_type]]$cluster)
+  for (state in names(markers_state[[cell_type]])) {
+    if (nrow(markers_state[[cell_type]][[state]]) == 0) {
+      markers_state[[cell_type]][[state]] = NULL
+    }
+  }
+  
+  ### 对每个细胞状态的标记基因进行注释
+  # 使用注释数据对每个细胞状态的标记基因打分，如果一个基因同时是细胞状态标记基因集和某细胞类注释标记基因，
+  # 其评分为此基因细胞状态"ave_log2FC"（除以最大值） * 某细胞类注释标记中"Expression, Scaled" * "Number of Cells Expressing Genes"（除以最大值）
+  for (state in names(markers_state[[cell_type]])) {
+    markers_state[[cell_type]][[state]] = as.data.frame(markers_state[[cell_type]][[state]])
+    rownames(markers_state[[cell_type]][[state]]) = markers_state[[cell_type]][[state]][["gene"]]
+    for (subtype in cell_subtype[[cell_type]]) {
+      markers_state[[cell_type]][[state]][[subtype]] = 0
+      for (marker in markers_state[[cell_type]][[state]][["gene"]]) {
+        if (marker %in% markers_db[[cell_type]][[subtype]][["Gene Symbol"]]) {
+          X = markers_db[[cell_type]][[subtype]]
+          Y = markers_state[[cell_type]][[state]]
+          score = 
+            (Y[marker, "avg_log2FC"] / max(Y[, "avg_log2FC"])) ^ 2 *
+            X[X[["Gene Symbol"]] == marker, "Expression, Scaled", drop = T] ^ 2 * 
+            (X[X[["Gene Symbol"]] == marker, "Number of Cells Expressing Genes"] / max(X[, "Number of Cells Expressing Genes"]))
+          markers_state[[cell_type]][[state]][marker, subtype] <- as.numeric(score)
+          rm(X, Y, score)
+        }
+      }
+    }
+  }
+  
+  # 基于每个标记基因的打分，计算所注释细胞类总分
+  state_anno[[cell_type]] = list()
+  state_anno[[cell_type]][["anno_df"]] = as.data.frame(matrix(
+    0, 
+    nrow = length(names(markers_state[[cell_type]])), 
+    ncol = length(cell_subtype[[cell_type]]), 
+    dimnames = list(names(markers_state[[cell_type]]), cell_subtype[[cell_type]])))
+  for (state in rownames(state_anno[[cell_type]][["anno_df"]])) {
+    for (subtype in colnames(state_anno[[cell_type]][["anno_df"]])) {
+      state_anno[[cell_type]][["anno_df"]][state, subtype] = sum(markers_state[[cell_type]][[state]][[subtype]])
+    }
+  }
+  
+  # 选出总分最高的注释类作为注释结果
+  state_anno[[cell_type]][["result"]] = as.data.frame(matrix(
+    0, 
+    nrow = length(names(markers_state[[cell_type]])), 
+    ncol = 3, 
+    dimnames = list(names(markers_state[[cell_type]]), c("cell_subtype", "score_retio", "cell_subtype_numbers"))))
+  for (state in rownames(state_anno[[cell_type]][["result"]])) {
+    state_anno[[cell_type]][["result"]][state, "cell_subtype"] <- names(which.max(state_anno[[cell_type]][["anno_df"]][state, ]))
+    row_data <- state_anno[[cell_type]][["anno_df"]][state, ]
+    state_anno[[cell_type]][["result"]][state, "score_retio"] <- max(row_data) / sum(row_data)
+    state_anno[[cell_type]][["result"]][state, "cell_subtype_numbers"] = length(cell_subtype[[cell_type]])
+  }; rm(row_data)
+  
+  # 提取注释用到的标记基因
+  for (state in rownames(state_anno[[cell_type]][["result"]])) {
+    state_anno[[cell_type]][[state]] = markers_state[[cell_type]][[state]]
+    state_anno[[cell_type]][[state]] = state_anno[[cell_type]][[state]][, c(
+      "gene", "p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", state_anno[[cell_type]][["result"]][state, "cell_subtype"])]
+    Z = state_anno[[cell_type]][[state]]
+    state_anno[[cell_type]][[state]] <- Z[Z[, ncol(Z)] > 0, ]
+    rm(Z)
+    # state_anno[[cell_type]][[state]] = state_anno[[cell_type]][[state]][, c(
+    #   "gene", "p_val")]
+  }
+  # state_anno[[cell_type]]
+}
+
+

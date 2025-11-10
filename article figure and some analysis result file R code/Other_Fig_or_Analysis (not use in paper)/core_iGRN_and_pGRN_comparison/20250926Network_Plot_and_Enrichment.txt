@@ -1,0 +1,1089 @@
+# Sys.setenv(LANGUAGE = "en")
+options(stringsAsFactors = FALSE)
+# rm(list=ls())
+
+library(igraph)
+library(dplyr)
+library(ggraph)
+library(ggplot2)
+library(patchwork)
+
+setwd("D:/pbmc-equation/")
+
+options(timeout = 60000)
+
+cell_type = "CD14 Mono"
+# cell_type = "CD4 Naive"
+# cell_type = "CD8 Naive"
+# cell_type = "CD4 TCM"
+
+
+########## 1 数据准备 ##########
+if (cell_type == "CD14 Mono") {
+  quantile_threshold = 0.95 # 区分关键的分位数阈值
+  top_threshold = 16 # 区分关键的排名阈值
+} else if (cell_type == "CD4 Naive") {
+  quantile_threshold = 0.8
+  top_threshold = 36
+} else if (cell_type == "CD8 Naive") {
+  quantile_threshold = 0.95
+  top_threshold = 36
+} else if (cell_type == "CD4 TCM") {
+  quantile_threshold = 0.95
+  top_threshold = 16
+}
+
+### 获取sGRN
+interest_cell_type_sGRN <- readRDS(paste0("./pr50 newest for paper/", cell_type, " result pr50/3 get sGRN/interest_cell_type_sGRN.rds"))
+sGRN = interest_cell_type_sGRN[[cell_type]]; rm(interest_cell_type_sGRN)
+
+### 获取pGRN
+interest_cell_type_branch_model_train <- readRDS(paste0("./pr50 newest for paper/", cell_type, " result pr50/4.2 BUild Prediction Model - Model Training And Evaluation/interest_cell_type_branch_model_train.rds"))
+pred_result = interest_cell_type_branch_model_train[[cell_type]][["best_pred_result"]][["pred_result"]]; rm(interest_cell_type_branch_model_train)
+pGRN = sGRN
+pGRN[, ] = 0
+for (TG in rownames(pGRN)) {
+  for (TF in colnames(pGRN)) {
+    theta = paste0("TG_", TG, "←", TF, "_TF")
+    if (theta %in% rownames(pred_result)) {
+      pGRN[TG, TF] = pred_result[theta, "theta_p"]
+    }
+  }
+}; rm(TG, TF, theta, pred_result)
+
+
+
+########## 2 寻找关键节点和边 ##########
+key_info = list()
+key_info[["sGRN"]] = list()
+key_info[["pGRN"]] = list()
+
+for (GRN_type in c("sGRN", "pGRN")) {
+  if (GRN_type == "sGRN") {key_info[[GRN_type]][["network"]] = sGRN} else {key_info[[GRN_type]][["network"]] = pGRN}
+  
+  
+  ##### 2.1 数据预处理 #####
+  if (GRN_type == "sGRN") {X = sGRN} else {X = pGRN} # 邻接矩阵为data.frame X, 行=TG, 列=TFG
+  adj_matrix <- t(X) # 转换邻接矩阵为igraph有向加权图
+  # ?graph_from_biadjacency_matrix
+  g <- graph_from_biadjacency_matrix(adj_matrix, directed = TRUE, weighted = TRUE)
+  
+  
+  ##### 2.2 关键节点指标计算 ##### 
+  # (1) 加权出度中心性 (仅TFG)
+  tfg_nodes <- V(g)[V(g)$type == FALSE]
+  # ?strength # 强度（Strength），也称为加权顶点度（weighted vertex degree），用于描述在加权图中，一个顶点所有相邻边的权重总和
+  out_strength <- strength(g, vids = tfg_nodes, mode = "out", weights = E(g)$weight)
+  
+  # (2) 加权入度中心性 (仅TG) - 新增代码
+  tg_nodes <- V(g)[V(g)$type == TRUE]
+  in_strength <- strength(g, vids = tg_nodes, mode = "in", weights = E(g)$weight)
+  
+  # (3) 改进PageRank (全网络加权)
+  # ?page_rank # 一个节点的重要性不仅取决于其自身，更取决于链接到它的其他节点的重要性
+  pagerank <- page_rank(g, directed = TRUE, weights = NULL, damping = 0.85)$vector # weights或E(g)$weight
+  
+  # (4) 介数中心性 (全网络)
+  # ?igraph::betweenness # 介数中心性 (Betweenness Centrality) 反映了节点或边在整个网络信息流中的“桥梁”或“中介”作用
+  betweenness <- igraph::betweenness(g, directed = TRUE, weights = 1/E(g)$weight) # 权重转化为距离
+  
+  # 整合结果
+  tfg_node_metrics <- data.frame(
+    node = names(tfg_nodes),
+    out_strength = out_strength,
+    pagerank = pagerank[names(tfg_nodes)],
+    betweenness = betweenness[names(tfg_nodes)]
+  ) %>% dplyr::filter(out_strength != 0) %>% mutate(across(-node, scales::rescale))
+  
+  tg_node_metrics <- data.frame(
+    node = names(tg_nodes),
+    in_strength = in_strength,
+    pagerank = pagerank[names(tg_nodes)],
+    betweenness = betweenness[names(tg_nodes)]
+  ) %>% dplyr::filter(in_strength != 0) %>% mutate(across(-node, scales::rescale))
+  
+  key_info[[GRN_type]][["tfg_node_metrics"]] = tfg_node_metrics
+  key_info[[GRN_type]][["tg_node_metrics"]] = tg_node_metrics
+  
+  
+  ##### 2.3 关键连边指标计算 #####
+  # (1) 边的权重
+  edge_weight = as.data.frame(as_edgelist(g, names = TRUE))
+  colnames(edge_weight) = c("from", "to")
+  edge_weight$edge_weight = E(g)$weight
+  edge_weight = edge_weight[edge_weight$from %in% colnames(X), ]
+  edge_weight = edge_weight[edge_weight$to %in% rownames(X), ]
+  rownames(edge_weight) = paste0(edge_weight$from, "→",edge_weight$to)
+  
+  # (2) 边介数中心性
+  # ?igraph::edge_betweenness # 边介数中心性 (Edge Betweenness Centrality) 反映了边在整个网络信息流中的“桥梁”作用。
+  edge_betweenness = as.data.frame(as_edgelist(g, names = TRUE))
+  colnames(edge_betweenness) = c("from", "to")
+  edge_betweenness$edge_betweenness <- igraph::edge_betweenness(g, directed = TRUE, weights = 1/E(g)$weight) # 权重转化为距离
+  edge_betweenness = edge_betweenness[edge_betweenness$from %in% colnames(X), ]
+  edge_betweenness = edge_betweenness[edge_betweenness$to %in% rownames(X), ]
+  rownames(edge_betweenness) = paste0(edge_betweenness$from, "→",edge_betweenness$to)
+  
+  # 合并边指标
+  edge_metrics = edge_weight
+  edge_metrics$edge_betweenness = 0
+  for (edge in rownames(edge_metrics)) {edge_metrics[edge, "edge_betweenness"] = edge_betweenness[edge, "edge_betweenness"]}
+  edge_metrics <- edge_metrics %>% mutate(across(-c(from, to), ~ scales::rescale(.x)))
+  
+  key_info[[GRN_type]][["edge_metrics"]] = edge_metrics
+  
+  
+  ##### 2.4 关键连边指标计算 #####
+  key_tfgs_in_nodes <- sort(tfg_node_metrics$node[
+    tfg_node_metrics$out_strength > max(
+      quantile(tfg_node_metrics$out_strength, quantile_threshold), 
+      sort(tfg_node_metrics$out_strength, decreasing = TRUE)[min(top_threshold, length(tfg_node_metrics$out_strength))]
+    ) | tfg_node_metrics$pagerank > max(
+      quantile(tfg_node_metrics$pagerank, quantile_threshold), 
+      sort(tfg_node_metrics$pagerank, decreasing = TRUE)[min(top_threshold, length(tfg_node_metrics$pagerank))]
+    ) | tfg_node_metrics$betweenness > max(
+      quantile(tfg_node_metrics$betweenness, quantile_threshold), 
+      sort(tfg_node_metrics$betweenness, decreasing = TRUE)[min(top_threshold, length(tfg_node_metrics$betweenness))]
+    )
+  ]); key_tfgs_in_nodes
+  
+  key_tgs_in_nodes <- sort(tg_node_metrics$node[
+    tg_node_metrics$in_strength > max(
+      quantile(tg_node_metrics$in_strength, quantile_threshold), 
+      sort(tg_node_metrics$in_strength, decreasing = TRUE)[min(top_threshold, length(tg_node_metrics$in_strength))]
+    ) | tg_node_metrics$pagerank > max(
+      quantile(tg_node_metrics$pagerank, quantile_threshold), 
+      sort(tg_node_metrics$pagerank, decreasing = TRUE)[min(top_threshold, length(tg_node_metrics$pagerank))]
+    ) | tg_node_metrics$betweenness > max(
+      quantile(tg_node_metrics$betweenness, quantile_threshold), 
+      sort(tg_node_metrics$betweenness, decreasing = TRUE)[min(top_threshold, length(tg_node_metrics$betweenness))]
+    )]); key_tgs_in_nodes
+  
+  key_tfgs_in_edges = sort(unique(edge_metrics$from[
+    edge_metrics$edge_weight > max(
+      quantile(edge_metrics$edge_weight, quantile_threshold), 
+      sort(edge_metrics$edge_weight, decreasing = TRUE)[min(top_threshold, length(edge_metrics$edge_weight))]
+    ) | edge_metrics$edge_betweenness > max(
+      quantile(edge_metrics$edge_betweenness, quantile_threshold), 
+      sort(edge_metrics$edge_betweenness, decreasing = TRUE)[min(top_threshold, length(edge_metrics$edge_betweenness))]
+    )])); key_tfgs_in_edges
+  
+  key_tgs_in_edges = sort(unique(edge_metrics$to[
+    edge_metrics$edge_weight > max(
+      quantile(edge_metrics$edge_weight, quantile_threshold), 
+      sort(edge_metrics$edge_weight, decreasing = TRUE)[min(top_threshold, length(edge_metrics$edge_weight))]
+    ) | edge_metrics$edge_betweenness > max(
+      quantile(edge_metrics$edge_betweenness, quantile_threshold), 
+      sort(edge_metrics$edge_betweenness, decreasing = TRUE)[min(top_threshold, length(edge_metrics$edge_betweenness))]
+    )])); key_tgs_in_edges
+  
+  key_tfgs = union(key_tfgs_in_nodes, key_tfgs_in_edges)
+  key_tgs = union(key_tgs_in_nodes, key_tgs_in_edges)
+  
+  key_info[[GRN_type]][["key_tfgs"]] = key_tfgs
+  key_info[[GRN_type]][["key_tgs"]] = key_tgs
+}; rm(list = setdiff(ls(), c("key_info", "cell_type")))
+
+key_info[["sGRN"]][["key_tfgs"]]; length(key_info[["sGRN"]][["key_tfgs"]])
+key_info[["sGRN"]][["key_tgs"]]; length(key_info[["sGRN"]][["key_tgs"]])
+key_info[["pGRN"]][["key_tfgs"]]; length(key_info[["pGRN"]][["key_tfgs"]])
+key_info[["pGRN"]][["key_tgs"]]; length(key_info[["pGRN"]][["key_tgs"]])
+
+base::saveRDS(key_info, file = paste0("./Results/3 network/", gsub(" ", "_", cell_type), "_key_info.rds"))
+
+
+
+########## 3 画网络图 ##########
+# 单独画sGRN和pGRN
+# TFG紫色、圆形，TG深蓝色、方形，
+# 共有边，实线
+# 独有边，虚线
+# pGRN大的边，深红色
+# sGRN大的边，深绿色
+# 变化不显著的边（小于10%），深灰色
+tfg_common = intersect(key_info[["sGRN"]][["key_tfgs"]], key_info[["pGRN"]][["key_tfgs"]])
+tg_common = intersect(key_info[["sGRN"]][["key_tgs"]], key_info[["pGRN"]][["key_tgs"]])
+
+edge_common = intersect(rownames(key_info[["sGRN"]][["edge_metrics"]]), rownames(key_info[["pGRN"]][["edge_metrics"]]))
+
+edge_all = union(rownames(key_info[["sGRN"]][["edge_metrics"]]), rownames(key_info[["pGRN"]][["edge_metrics"]]))
+for (i in 1:length(edge_all)) {
+  edge = edge_all[i]
+  tfg <- strsplit(edge, "→")[[1]][1]
+  tg <- strsplit(edge, "→")[[1]][2]
+  if (key_info[["sGRN"]][["network"]][tg, tfg] > key_info[["pGRN"]][["network"]][tg, tfg] * 1.1) {
+    names(edge_all)[i] = "sGRN"
+  } else if (key_info[["sGRN"]][["network"]][tg, tfg] < key_info[["pGRN"]][["network"]][tg, tfg] * 0.9) {
+    names(edge_all)[i] = "pGRN"
+  } else {
+    names(edge_all)[i] = "change_little"
+  }
+}
+
+for (GRN_type in c("sGRN", "pGRN")) {
+  ##### 3.1 提取的邻接矩阵（转录因子为行，目标基因为列） #####
+  # 定义一些转录因子和目标基因的名称
+  key_tfgs <- key_info[[GRN_type]][["key_tfgs"]]
+  key_tgs <- key_info[[GRN_type]][["key_tgs"]]
+  
+  # 创建一个行名为转录因子，列名为目标基因的矩阵，并用0初始化
+  adj_matrix = t(key_info[[GRN_type]][["network"]][key_tgs, key_tfgs])
+  
+  
+  ##### 3.2 将邻接矩阵转换为igraph图对象 #####
+  net <- graph_from_biadjacency_matrix(adj_matrix, directed = TRUE, weighted = TRUE, 
+                                       mode = "out", add.names = NULL)
+  
+  
+  ##### 3.3 设置顶点(Node)属性，便于可视化时区分转录因子和目标基因 #####
+  # 为转录因子(TF)创建两个分组
+  tfg_only = setdiff(key_tfgs, tfg_common)
+  tfg_groups <- setNames(ifelse(key_tfgs %in% tfg_only, "tfg_only", "tfg_common"), key_tfgs)
+  
+  # 为目标基因(Gene)创建两个分组
+  tg_only = setdiff(key_tgs, tg_common)
+  tg_groups <- setNames(ifelse(key_tgs %in% tg_only, "tg_only", "tg_common"), key_tgs)
+  
+  # 设置节点分组属性
+  V(net)$group <- ifelse(!V(net)$type,  # 转录因子节点 (type = FALSE)
+                         tfg_groups[V(net)$name], 
+                         tg_groups[V(net)$name])
+  
+  # 设置节点颜色 - 为不同分组指定不同颜色
+  tfg_colors <- c("tfg_common" = "purple", "tfg_only" = "purple")
+  tg_colors <- c("tg_common" = "darkblue", "tg_only" = "darkblue")
+  V(net)$color <- ifelse(!V(net)$type, 
+                         tfg_colors[V(net)$group],
+                         tg_colors[V(net)$group])
+  
+  # 设置节点形状
+  V(net)$shape <- ifelse(V(net)$type, "square", "circle")
+  
+  # 计算节点的度（连边权重之和）
+  node_strength <- strength(net, mode = "all", weights = E(net)$weight)
+  
+  # 归一化节点度（除以最大度值）
+  normalized_strength <- node_strength / max(node_strength)
+  
+  # 设置节点大小
+  V(net)$size <- 0.1 + normalized_strength * 20
+  
+  # 设置节点透明度
+  V(net)$alpha <- 1 - normalized_strength
+  
+  # 设置标签为节点名
+  V(net)$label <- V(net)$name
+  
+  
+  ##### 3.4 设置边(Edge)属性 #####
+  # 边的透明度映射权重：值越大透明度越低(越不透明)，值越小透明度越高(越透明)
+  E(net)$alpha <- E(net)$weight ^ 2
+  
+  # 边的宽度映射权重：值越大边越粗，值越小边越细
+  E(net)$width <- E(net)$weight ^ 2
+  
+  # 将边分为6个集合：公共边/专属边 + 升高/不变/降低
+  edge_groups = as.data.frame(as_edgelist(net, names = TRUE))
+  edge_groups[, 3:5] = 0
+  for (i in 1:nrow(edge_groups)) {
+    if(paste0(edge_groups[i, 1], "→", edge_groups[i, 2]) %in% edge_common) {
+      edge_groups[i, 3] = "edge_common"
+    } else {
+      edge_groups[i, 3] = "edge_only"
+    }
+    edge_groups[i, 4] = names(edge_all)[which(edge_all == paste0(edge_groups[, 1], "→", edge_groups[, 2])[i])]
+  }
+  edge_groups[, 5] = paste0(edge_groups[, 3], "+", edge_groups[, 4])
+  E(net)$edge_group = edge_groups[, 5]
+  E(net)$edge_group <- factor(E(net)$edge_group, levels = c("edge_common+change_little",
+                                                            "edge_common+pGRN",
+                                                            "edge_common+sGRN",
+                                                            "edge_only+change_little",
+                                                            "edge_only+pGRN",
+                                                            "edge_only+sGRN"))
+  
+  
+  ##### 3.5 绘制静态网络图 #####
+  net_plot = ggraph(net, circular = F, layout = "sugiyama") + # kk', "stress",
+    
+    # 绘制边，添加箭头明确指示方向，设置颜色和线型根据分组变化
+    geom_edge_link(aes(alpha = alpha, edge_width = width, color = edge_group, linetype = edge_group), 
+                   arrow = arrow(angle = 10, type = 'closed', length = unit(4.5, "mm"), ends = "last"), show.legend = FALSE) +
+    
+    # 绘制节点，根据分组设置颜色、根据度设置大小和透明度
+    geom_node_point(aes(color = color, shape = shape, size = size, alpha = alpha), show.legend = FALSE) +
+    
+    # 添加节点标签
+    geom_node_text(aes(label = label), check_overlap = TRUE, repel = TRUE, size = 3, max.overlaps = Inf, color = "darkorange", fontface = "bold") +
+    
+    # 设置主题
+    theme_void() +
+    
+    # 设置颜色和形状的尺度
+    scale_colour_identity() +
+    scale_shape_identity() +
+    scale_size_identity() +
+    
+    # 设置节点透明度尺度
+    scale_alpha_continuous(range = c(1, 0.1)) +
+    
+    # 设置边的透明度尺度
+    scale_edge_alpha_continuous(range = c(1, 0.1)) +
+    
+    # 设置边的宽度尺度
+    scale_edge_width_continuous(range = c(1, 0.1)) +
+    
+    # 设置边的颜色尺度
+    scale_edge_color_manual(values = c("edge_common+change_little" = "darkgrey", 
+                                       "edge_common+pGRN" = "darkred", 
+                                       "edge_common+sGRN" = "darkgreen",  
+                                       "edge_only+change_little" = "darkgrey", 
+                                       "edge_only+pGRN" = "darkred", 
+                                       "edge_only+sGRN" = "darkgreen"),
+                            name = "Edge Group") +
+    
+    # 设置边的线型尺度
+    scale_edge_linetype_manual(values = c("edge_common+change_little" = "solid",
+                                          "edge_common+pGRN" = "solid",
+                                          "edge_common+sGRN" = "solid", 
+                                          "edge_only+change_little" = "dashed",
+                                          "edge_only+pGRN" = "dashed",
+                                          "edge_only+sGRN" = "dashed"),
+                               name = "Edge Group") +
+    
+    # 添加图例说明分组信息
+    labs(title = paste0(cell_type, " Key ", GRN_type))
+  
+  key_info[[GRN_type]][["net_plot"]] = net_plot
+}
+
+ggsave(paste0("./Results/3 network/", cell_type, " Key GRN.png"),
+       plot = key_info[["sGRN"]][["net_plot"]] / key_info[["pGRN"]][["net_plot"]], limitsize = FALSE,
+       width = max(length(key_tfgs), length(key_tgs)) ^ 0.8, height = 6, dpi = 600)
+
+rm(list = setdiff(ls(), c("key_info", "cell_type")))
+
+
+
+########## 4 准备富集分析数据 ##########
+library(dplyr)
+library(Seurat)
+library(clusterProfiler)
+library(ggplot2)
+library(reshape2)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+# 获取全关键基因集（sGRN和pGRN的关键基因集并集）
+Basic_Info_with_EXP_ACT <- readRDS("./UMAP/Basic_Info_with_EXP_ACT.rds")
+scRNAseq <- Basic_Info_with_EXP_ACT$scRNAseq_for_GRN
+scATACseq <- Basic_Info_with_EXP_ACT$scATACseq_for_GRN
+rm(Basic_Info_with_EXP_ACT)
+
+key_tfgs_all = union(key_info[["sGRN"]][["key_tfgs"]], key_info[["pGRN"]][["key_tfgs"]])
+key_tgs_all = union(key_info[["sGRN"]][["key_tgs"]], key_info[["pGRN"]][["key_tgs"]])
+key_genes_all_SYMBOL = unique(c(key_tfgs_all, key_tgs_all))
+key_genes_all_ENTREZID <- bitr(key_genes_all_SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)[, "ENTREZID"]
+
+# 获取全关键基因集的组学数据
+scRNAseq <- subset(scRNAseq, features = key_genes_all_SYMBOL, subset = seurat_annotations == cell_type)
+scATACseq <- subset(scATACseq, features = key_genes_all_SYMBOL, subset = seurat_annotations == cell_type)
+scRNAseq = NormalizeData(scRNAseq)
+scATACseq = NormalizeData(scATACseq)
+
+
+
+########## 5 全关键基因集（sGRN和pGRN的关键基因集并集）富集分析 ##########
+# 定义转换函数
+convert_fraction <- function(fraction_str) {
+  sapply(strsplit(fraction_str, "/"), function(x) as.numeric(x[1]) / as.numeric(x[2]))
+}
+
+
+##### 5.1 富集分析 #####
+if (cell_type == "CD14 Mono") {
+  count_threshold = 5
+  generatio_threshold = 0.3
+  pq_threshold = 0.01
+} else if (cell_type == "CD4 Naive") {
+  count_threshold = 5
+  generatio_threshold = 0.3
+  pq_threshold = 0.01
+} else if (cell_type == "CD8 Naive") {
+  count_threshold = 5
+  generatio_threshold = 0.3
+  pq_threshold = 0.01
+} else if (cell_type == "CD4 TCM") {
+  count_threshold = 5
+  generatio_threshold = 0.3
+  pq_threshold = 0.01
+}
+
+### GO富集分析
+enrichGO_key_genes_all <- enrichGO(gene = key_genes_all_SYMBOL, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "ALL", minGSSize = 2, readable = TRUE, 
+                                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH")
+enrich_empty = enrichGO_key_genes_all
+enrich_empty@result <- enrich_empty@result[FALSE, ]
+enrich_empty@ontology = character(0)
+enrich_empty@gene = character(0)
+enrich_empty@universe = character(0)
+enrich_empty@geneSets = list()
+if (!is.null(enrichGO_key_genes_all)) {
+  enrichGO_key_genes_all_filtered = clusterProfiler::simplify(enrichGO_key_genes_all)
+  result = enrichGO_key_genes_all_filtered@result
+  result <- result[order(-result$FoldEnrichment), ]
+  result = result[result$Count > count_threshold | convert_fraction(result$GeneRatio) >= generatio_threshold, ]
+  result = result[result$pvalue < pq_threshold & result$p.adjust < pq_threshold & result$qvalue < pq_threshold, ]
+  enrichGO_key_genes_all_filtered@result = result; rm(result)
+} else {enrichGO_key_genes_all_filtered = enrich_empty}
+
+### KEGG富集分析
+enrichKEGG_key_genes_all <- enrichKEGG(gene = key_genes_all_ENTREZID, keyType = "kegg", organism = "hsa", minGSSize = 2, use_internal_data = FALSE,
+                                       pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH") # 每次都下载太慢了
+# KEGG_gmt = download_KEGG(species = "hsa", keggType = "KEGG", keyType = "kegg")
+# base::saveRDS(KEGG_gmt, file = "./Results/4 enrichment/KEGG_gmt.rds")
+# KEGG_gmt <- readRDS("D:/pbmc-equation/Results/4 enrichment/KEGG_gmt.rds")
+# enrichKEGG_key_genes_all1 <- enricher(
+#   gene = key_genes_all_ENTREZID,
+#   pvalueCutoff = 0.05,
+#   pAdjustMethod = "BH",
+#   minGSSize = 2,
+#   qvalueCutoff = 0.2,
+#   TERM2GENE = KEGG_gmt$KEGGPATHID2EXTID,
+#   TERM2NAME = KEGG_gmt$KEGGPATHID2NAME
+# )
+if (!is.null(enrichKEGG_key_genes_all)) {
+  enrichKEGG_key_genes_all <- setReadable(enrichKEGG_key_genes_all, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  enrichKEGG_key_genes_all_filtered = enrichKEGG_key_genes_all
+  result = enrichKEGG_key_genes_all_filtered@result
+  result <- result[order(-result$FoldEnrichment), ]
+  result = result[result$Count > count_threshold | convert_fraction(result$GeneRatio) >= generatio_threshold, ]
+  result = result[result$pvalue < pq_threshold & result$p.adjust < pq_threshold & result$qvalue < pq_threshold, ]
+  enrichKEGG_key_genes_all_filtered@result = result; rm(result)
+} else {enrichKEGG_key_genes_all_filtered = enrich_empty}
+
+### KEGG模块富集分析
+enrichMKEGG_key_genes_all <- enrichMKEGG(gene = key_genes_all_ENTREZID, keyType = "kegg", organism = "hsa", minGSSize = 2, 
+                                         pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH")
+if (!is.null(enrichMKEGG_key_genes_all)) {
+  enrichMKEGG_key_genes_all <- setReadable(enrichMKEGG_key_genes_all, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  enrichMKEGG_key_genes_all_filtered = enrichMKEGG_key_genes_all
+  result = enrichMKEGG_key_genes_all_filtered@result
+  result <- result[order(-result$FoldEnrichment), ]
+  result = result[result$Count > count_threshold | convert_fraction(result$GeneRatio) >= generatio_threshold, ]
+  result = result[result$pvalue < pq_threshold & result$p.adjust < pq_threshold & result$qvalue < pq_threshold, ]
+  enrichMKEGG_key_genes_all_filtered@result = result; rm(result)
+} else {enrichMKEGG_key_genes_all_filtered = enrich_empty}
+
+### Pathway Commons富集分析，包括但不限于：通路数据库KEGG Pathway, Reactome, PANTHER Pathway, WikiPathways, NCI Pathway Interaction Database, NetPath；蛋白质相互作用(PPI)数据库BioGRID, HPRD, IntAct
+enrichPC_key_genes_all <- enrichPC(gene = key_genes_all_SYMBOL, minGSSize = 2, pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH")
+if (!is.null(enrichPC_key_genes_all)) {
+  enrichPC_key_genes_all_filtered = enrichPC_key_genes_all
+  result = enrichPC_key_genes_all_filtered@result
+  result <- result[order(-result$FoldEnrichment), ]
+  result = result[result$Count > count_threshold | convert_fraction(result$GeneRatio) >= generatio_threshold, ]
+  result = result[result$pvalue < pq_threshold & result$p.adjust < pq_threshold & result$qvalue < pq_threshold, ]
+  enrichPC_key_genes_all_filtered@result = result; rm(result)
+} else {enrichPC_key_genes_all_filtered = enrich_empty}
+
+### WikiPathways富集分析
+# enrichWP_key_genes_all <- enrichWP(gene = key_genes_all_ENTREZID, organism = "Homo sapiens", minGSSize = 2, pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH")
+# 有可能超时报错
+# download.file(
+#   url = "https://data.wikipathways.org/current/gmt/wikipathways-20250910-gmt-Homo_sapiens.gmt",
+#   destfile = "./Results/4 enrichment/wikipathways-20250910-gmt-Homo_sapiens.gmt",
+#   mode = "wb"
+# )
+wp_gmt <- clusterProfiler::read.gmt("./Results/4 enrichment/wikipathways-20250910-gmt-Homo_sapiens.gmt")
+enrichWP_key_genes_all <- enricher(
+  gene = key_genes_all_ENTREZID,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  minGSSize = 2,
+  qvalueCutoff = 0.2,
+  TERM2GENE = wp_gmt
+)
+if (!is.null(enrichWP_key_genes_all)) {
+  enrichWP_key_genes_all <- setReadable(enrichWP_key_genes_all, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  enrichWP_key_genes_all_filtered = enrichWP_key_genes_all
+  result = enrichWP_key_genes_all_filtered@result
+  result <- result[order(-result$FoldEnrichment), ]
+  result = result[result$Count > count_threshold | convert_fraction(result$GeneRatio) >= generatio_threshold, ]
+  result = result[result$pvalue < pq_threshold & result$p.adjust < pq_threshold & result$qvalue < pq_threshold, ]
+  enrichWP_key_genes_all_filtered@result = result; rm(result)
+} else {enrichWP_key_genes_all_filtered = enrich_empty}
+
+### 富集分析汇总
+# 写入GO
+enrich_key_genes_all_filtered = enrichGO_key_genes_all_filtered
+enrich_key_genes_all_filtered@result$ID = paste0(enrich_key_genes_all_filtered@result$ONTOLOGY, ".", enrich_key_genes_all_filtered@result$ID)
+enrich_key_genes_all_filtered@result$ONTOLOGY = NULL
+
+# 写入KEGG的result
+result = enrichKEGG_key_genes_all_filtered@result
+result$ID = paste(result$category, result$subcategory, result$ID, sep = ".")
+result$category = NULL; result$subcategory = NULL
+enrich_key_genes_all_filtered@result = rbind(enrich_key_genes_all_filtered@result, result); rm(result)
+
+# 写入KEGG的ontology
+enrich_key_genes_all_filtered@ontology = c(enrich_key_genes_all_filtered@ontology, enrichKEGG_key_genes_all_filtered@ontology)
+
+# 写入KEGG的universe
+enrich_key_genes_all_filtered@universe <- unique(c(
+  enrich_key_genes_all_filtered@universe, bitr(enrichKEGG_key_genes_all_filtered@universe, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)$SYMBOL))
+
+# 写入KEGG的geneSets
+geneSets = enrichKEGG_key_genes_all_filtered@geneSets
+entrez2symbol_map <- bitr(unique(unlist(geneSets, use.names = FALSE)), fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+map_vector <- setNames(entrez2symbol_map$SYMBOL, entrez2symbol_map$ENTREZID)
+geneSets <- lapply(geneSets, function(single_geneset) {na.omit(map_vector[single_geneset])}); rm(entrez2symbol_map, map_vector)
+enrich_key_genes_all_filtered@geneSets = c(enrich_key_genes_all_filtered@geneSets, geneSets); rm(geneSets)
+
+# 写入MKEGG的result
+enrich_key_genes_all_filtered@result = rbind(enrich_key_genes_all_filtered@result, enrichMKEGG_key_genes_all_filtered@result)
+
+# 写入MKEGG的ontology
+enrich_key_genes_all_filtered@ontology = c(enrich_key_genes_all_filtered@ontology, enrichMKEGG_key_genes_all_filtered@ontology)
+
+# 写入MKEGG的universe
+enrich_key_genes_all_filtered@universe <- unique(c(
+  enrich_key_genes_all_filtered@universe, bitr(enrichMKEGG_key_genes_all_filtered@universe, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)$SYMBOL))
+
+# 写入MKEGG的geneSets
+geneSets = enrichMKEGG_key_genes_all_filtered@geneSets
+entrez2symbol_map <- bitr(unique(unlist(geneSets, use.names = FALSE)), fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+map_vector <- setNames(entrez2symbol_map$SYMBOL, entrez2symbol_map$ENTREZID)
+geneSets <- lapply(geneSets, function(single_geneset) {na.omit(map_vector[single_geneset])}); rm(entrez2symbol_map, map_vector)
+enrich_key_genes_all_filtered@geneSets = c(enrich_key_genes_all_filtered@geneSets, geneSets); rm(geneSets)
+
+# 写入PC的result
+enrich_key_genes_all_filtered@result = rbind(enrich_key_genes_all_filtered@result, enrichPC_key_genes_all_filtered@result)
+
+# 写入PC的ontology
+enrich_key_genes_all_filtered@ontology = c(enrich_key_genes_all_filtered@ontology, enrichPC_key_genes_all_filtered@ontology)
+
+# 写入PC的universe
+enrich_key_genes_all_filtered@universe <- unique(c(enrich_key_genes_all_filtered@universe, enrichPC_key_genes_all_filtered@universe))
+
+# 写入PC的geneSets
+enrich_key_genes_all_filtered@geneSets = c(enrich_key_genes_all_filtered@geneSets, enrichPC_key_genes_all_filtered@geneSets)
+
+# 写入WP的result
+enrich_key_genes_all_filtered@result = rbind(enrich_key_genes_all_filtered@result, enrichWP_key_genes_all_filtered@result)
+
+# 写入WP的ontology
+enrich_key_genes_all_filtered@ontology = c(enrich_key_genes_all_filtered@ontology, enrichWP_key_genes_all_filtered@ontology)
+
+# 写入WP的universe
+enrich_key_genes_all_filtered@universe <- unique(c(
+  enrich_key_genes_all_filtered@universe, bitr(enrichWP_key_genes_all_filtered@universe, fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)$SYMBOL))
+
+# 写入WP的geneSets
+geneSets = enrichWP_key_genes_all_filtered@geneSets
+entrez2symbol_map <- bitr(unique(unlist(geneSets, use.names = FALSE)), fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+map_vector <- setNames(entrez2symbol_map$SYMBOL, entrez2symbol_map$ENTREZID)
+geneSets <- lapply(geneSets, function(single_geneset) {na.omit(map_vector[single_geneset])}); rm(entrez2symbol_map, map_vector)
+enrich_key_genes_all_filtered@geneSets = c(enrich_key_genes_all_filtered@geneSets, geneSets); rm(geneSets)
+
+print(rownames(enrich_key_genes_all_filtered@result))
+
+save.image(paste0("./Results/4 enrichment/", cell_type, " Network plot and enrichcode5.1.RData"))
+# load(paste0("./Results/4 enrichment/", cell_type, " Network plot and enrichcode5.1.RData"))
+
+
+##### 5.2 富集分析画图 #####
+### 富集通路的FoldEnrichment、p.adjust、count的气泡图Dotplot
+enrich_key_genes_all_filtered@result$logFoldEnrichment = log(enrich_key_genes_all_filtered@result$FoldEnrichment)
+dotplot_key_genes_all_showCategory = nrow(enrich_key_genes_all_filtered@result)
+dotplot_key_genes_all = dotplot(
+  enrich_key_genes_all_filtered, 
+  x = "logFoldEnrichment",
+  color = "p.adjust",
+  size = "Count",
+  showCategory = dotplot_key_genes_all_showCategory,
+  title = paste0(cell_type, " All Key Genes Enrichment Dotplot"),
+  label_format = 40
+) + theme(
+  axis.text.y = element_text(size = 9),
+  plot.title = element_text(hjust = 1)
+); dotplot_key_genes_all
+ggsave(filename = paste0("./Results/4 enrichment/", cell_type, " All Key Genes Enrichment Dotplot.png"), plot = dotplot_key_genes_all, 
+       width = sqrt(nrow(enrich_key_genes_all_filtered@result)) + 2, height = 0.3 * (dotplot_key_genes_all_showCategory + 2))
+
+### gene-pathway的热图Heatplot
+# 构造基因-通路关系矩阵
+all_gene_and_pathway_logical_matrix <- t(sapply(enrich_key_genes_all_filtered@result$geneID, function(gene_list) {
+  key_genes_all_SYMBOL %in% unlist(strsplit(gene_list, "/"))
+}))
+rownames(all_gene_and_pathway_logical_matrix) <- enrich_key_genes_all_filtered@result$Description
+colnames(all_gene_and_pathway_logical_matrix) <- key_genes_all_SYMBOL
+
+# 为每个基因创建一个颜色类别向量
+gene_color_map <- case_when(
+  (key_genes_all_SYMBOL %in% key_tfgs_all) & !(key_genes_all_SYMBOL %in% key_tgs_all) ~ "Red",
+  !(key_genes_all_SYMBOL %in% key_tfgs_all) & (key_genes_all_SYMBOL %in% key_tgs_all) ~ "Blue",
+  TRUE ~ "Black"
+)
+names(gene_color_map) <- key_genes_all_SYMBOL
+
+# 将逻辑矩阵转换为ggplot2适用的长格式
+plot_data <- all_gene_and_pathway_logical_matrix %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Pathway") %>% # 通路描述作为一列
+  melt(id.vars = "Pathway", variable.name = "Gene", value.name = "Present") %>%
+  filter(Present == TRUE) # 只保留存在关联的行（TRUE）
+all_gene_and_pathway_logical_matrix = all_gene_and_pathway_logical_matrix[, apply(all_gene_and_pathway_logical_matrix, 2, any)]
+
+# 将颜色映射信息添加到绘图数据中
+plot_data <- plot_data %>%
+  mutate(Color_Category = gene_color_map[as.character(Gene)]) # 根据基因名匹配颜色类别
+
+# 绘制热图
+heatplot_key_genes_all = ggplot(
+  plot_data, aes(x = Gene, y = Pathway)) +
+  geom_tile(aes(fill = Color_Category), color = "white", linewidth = 0.3) + # 使用颜色类别填充，并设置白色边框
+  scale_fill_manual(
+    values = c("Blue" = "blue", "Black" = "black", "Red" = "red"),
+    labels = c("Both", "TG", "TF"), # 修改图例标签
+    guide = guide_legend(title = "Gene type") # 可自定义图例标题
+  ) +
+  labs(
+    title = paste0(cell_type, " Association Heatmap of All Key Genes And Enrichment Pathways"),
+    x = "Gene",
+    y = "Pathway"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 9), 
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 1, size = 12),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9),
+    legend.key.size = unit(0.5, "cm"),
+    legend.spacing.x = unit(0.5, 'cm'),
+    legend.position = "top"
+  )
+print(heatplot_key_genes_all)
+ggsave(filename = paste0("./Results/4 enrichment/", cell_type, " Association Heatmap of All Keys Genes And Enrichment Pathways.png"), 
+       plot = heatplot_key_genes_all, 
+       width = (ncol(all_gene_and_pathway_logical_matrix) + 1 +
+                  max(nchar(rownames(all_gene_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85, 
+       height = (nrow(all_gene_and_pathway_logical_matrix) + 3 + 
+                   max(nchar(colnames(all_gene_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1, 
+       limitsize = FALSE, dpi = 600)
+rm(gene_color_map, plot_data)
+
+
+
+########## 6 sGRN和gGRN的regulon的平均theta的差异分析 ##########
+# 提取regulon基因集，做以上的富集分析
+# regulon-pathway矩阵，值为regulon在pathway上FoldEnrichment
+
+
+##### 6.1 提取regulon的基因集和平均theta #####
+if (cell_type == "CD14 Mono") {change_threshold = 0.11} else 
+  if (cell_type == "CD4 Naive") {change_threshold = 0.05} else 
+    if (cell_type == "CD8 Naive") {change_threshold = 0.08} else 
+      if (cell_type == "CD4 TCM") {change_threshold = 0.11}
+
+sGRN = key_info[["sGRN"]][["network"]]
+pGRN = key_info[["pGRN"]][["network"]]
+regulon_list = list()
+for (TG in sort(intersect(rownames(sGRN), rownames(pGRN)))) {
+  regulon_list[[paste0("TG_", TG, "_regulon")]] = list()
+  regulon_list[[paste0("TG_", TG, "_regulon")]][["genes"]] = c(
+    TG, setdiff(sort(base::union(names(sGRN[TG, ])[which(sGRN[TG, ] != 0)], 
+                                 names(pGRN[TG, ])[which(pGRN[TG, ] != 0)])), TG)
+  )
+  regulon_list[[paste0("TG_", TG, "_regulon")]][["average_standard_theta"]] = mean(sGRN[TG, ][sGRN[TG, ] != 0])
+  regulon_list[[paste0("TG_", TG, "_regulon")]][["average_predictive_theta"]] = mean(pGRN[TG, ][pGRN[TG, ] != 0])
+}
+for (TFG in sort(intersect(colnames(sGRN), colnames(pGRN)))) {
+  regulon_list[[paste0("TFG_", TFG, "_regulon")]] = list()
+  regulon_list[[paste0("TFG_", TFG, "_regulon")]][["genes"]] = c(
+    TFG, setdiff(sort(base::union(rownames(sGRN[, TFG, drop = F])[which(sGRN[, TFG] != 0)], 
+                                  rownames(pGRN[, TFG, drop = F])[which(pGRN[, TFG] != 0)])), TFG)
+  )
+  regulon_list[[paste0("TFG_", TFG, "_regulon")]][["average_standard_theta"]] = mean(sGRN[, TFG][sGRN[, TFG] != 0])
+  regulon_list[[paste0("TFG_", TFG, "_regulon")]][["average_predictive_theta"]] = mean(pGRN[, TFG][pGRN[, TFG] != 0])
+}
+# rm(sGRN, pGRN)
+for (regulon in names(regulon_list)) {
+  if (length(regulon_list[[regulon]][["genes"]]) <= 1) {
+    regulon_list[[regulon]] = NULL
+  }
+}
+
+regulon_df = as.data.frame(matrix(0, nrow = length(regulon_list), ncol = 3, dimnames = list(NULL, c("regulon", "stheta", "ptheta"))))
+regulon_df$regulon = names(regulon_list)
+for (i in 1:nrow(regulon_df)) {
+  regulon = regulon_df[i, "regulon"]
+  regulon_df[i, "stheta"] = regulon_list[[regulon]][["average_standard_theta"]]
+  regulon_df[i, "ptheta"] = regulon_list[[regulon]][["average_predictive_theta"]]
+}; rm(i)
+regulon_df[is.na(regulon_df)] = 1e-3
+regulon_df[, "FoldChange"] = round(regulon_df$ptheta / regulon_df$stheta, digits = 3)
+regulon_df$group <- ifelse(regulon_df$FoldChange > 1 + change_threshold, "Up",
+                           ifelse(regulon_df$FoldChange < 1 - change_threshold, "Down", "Median"))
+
+regulon_up_list = list()
+up_regulons = regulon_df %>% filter(group == "Up") %>% pull(regulon)
+if (length(up_regulons) > 0) {
+  for (up_regulon in up_regulons) {
+    regulon_up_list[[up_regulon]] = regulon_list[[up_regulon]]
+  }; rm(up_regulon)
+}
+
+regulon_down_list = list()
+down_regulons = regulon_df %>% filter(group == "Down") %>% pull(regulon)
+if (length(down_regulons) > 0) {
+  for (down_regulon in down_regulons) {
+    regulon_down_list[[down_regulon]] = regulon_list[[down_regulon]]
+  }; rm(down_regulon)
+}
+
+print(names(regulon_up_list))
+print(names(regulon_down_list))
+
+
+##### 6.2 sGRM和pGRN中regulon的theta的差异分析 #####
+# 分布图
+theta_distribution_plot <- ggplot(regulon_df %>% tidyr::pivot_longer(
+  cols = c("stheta", "ptheta"), names_to = "variable", values_to = "value"
+), aes(x = value, fill = variable, color = variable)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, alpha = 0.2, position = "identity") +
+  geom_density(linewidth = 1.2, alpha = 0.2, adjust = 1) +
+  scale_fill_manual(name = "", values = c("stheta" = "#69b3a2", "ptheta" = "#E69F00")) +
+  scale_color_manual(name = "", values = c("stheta" = "#69b3a2", "ptheta" = "#E69F00")) +
+  labs(
+    title = paste0(cell_type, " θ Frequency Distribution Histogram and Kernel Density Curve"),
+    x = "θ", 
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10), legend.position = "top")
+print(theta_distribution_plot)
+ggsave(filename = paste0("./Results/4 enrichment/", cell_type, " θ distribution plot.png"), plot = theta_distribution_plot, 
+       width = 5, height = 3) # 正态分布
+
+### FC双侧柱状图
+regulon_df_plot <- regulon_df[regulon_df$group %in% c("Down", "Up"), ] %>% # 1. 筛选数据并创建中心化后的绘图数值 (FoldChange - 1, 使1变为0)
+  mutate(PlotValue = FoldChange - 1)
+regulon_df_plot$group <- factor(regulon_df_plot$group, levels = c("Down", "Up")) # 2.确保分组因子水平正确
+
+if (cell_type == "CD14 Mono") {text_size = 2} else 
+  if (cell_type == "CD4 Naive") {text_size = 2} else 
+    if (cell_type == "CD8 Naive") {text_size = 2} else 
+      if (cell_type == "CD4 TCM") {text_size = 1.6}
+
+theta_differential_bidirectional_barplot = ggplot(regulon_df_plot, # 3.绘制以1为中轴线的双侧柱状图，并添加数据标签
+                                                  aes(x = reorder(regulon, PlotValue), 
+                                                      y = PlotValue, 
+                                                      fill = group)) +
+  geom_col() + # 绘制柱状图
+  # 添加数据标签：根据PlotValue的正负决定标签位置和显示内容
+  geom_text(aes(label = round(FoldChange, 2), # 显示原始FoldChange值，保留2位小数
+                y = ifelse(PlotValue > 0, PlotValue + 0.02, PlotValue - 0.02)),  # 轻微偏移避免重叠
+            size = text_size) +
+  geom_hline(yintercept = 0, color = "darkorange", linetype = "solid", size = 1) + 
+  coord_flip() + # 翻转坐标轴，使柱子水平，Y轴标签更清晰[2,6,8](@ref)
+  # 设置Y轴（即翻转后的X轴）范围：通过限制中心化后的值来实现原始值0.6-1.4的范围
+  coord_cartesian(ylim = c(-0.35, 0.35)) + # 因为PlotValue = FoldChange - 1, 所以0.6->-0.4, 1.4->0.4[7](@ref)
+  scale_y_continuous(
+    # 设置刻度线和标签，映射回原始FoldChange值
+    breaks = c(-0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4),
+    labels = c(0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4) # 映射回原始FoldChange值
+  ) +
+  scale_fill_manual(values = c("Down" = "blue", "Up" = "red")) + # 设置填充色
+  labs(x = "Regulon", 
+       y = "Fold Change", 
+       title = "Regulon Average θ Fold Change",
+       fill = "pGRN compared to sGRN") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 7), # 旋转原来的Y轴（Fold Change值）标签45度
+        legend.position = "top", 
+        legend.justification = c(1, 0),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9),
+        legend.key.size = unit(0.5, "cm"),
+        legend.spacing.x = unit(0.5, 'cm'),
+        plot.title = element_text(hjust = 0.5, size = 12))
+print(theta_differential_bidirectional_barplot)
+ggsave(filename = paste0("./Results/4 enrichment/", cell_type, " θ differential bidirectional barplot.png"), plot = theta_differential_bidirectional_barplot, 
+       width = (ncol(regulon_df_plot) + 1 ) * 0.4 + 0.5, height = 4) # 正态分布
+rm(regulon_df_plot)
+
+
+##### 6.3 sGRM和pGRN中差异regulon的富集分析 #####
+### 富集分析
+options(timeout = 60000)
+for (direction in c("up", "down")) {
+  if (direction == "up") {Regulon_list = regulon_up_list} else {Regulon_list = regulon_down_list}
+  if (length(Regulon_list) == 0) {next}
+  
+  i = 0
+  for (regulon in names(Regulon_list)) {
+    i = i + 1
+    message(paste0(i, "th regulon in ", length(Regulon_list), " ", direction, " regulons: ", regulon))
+    
+    regulon_SYMBOL = Regulon_list[[regulon]][["genes"]]
+    regulon_ENTREZID <- bitr(regulon_SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)[, "ENTREZID"]
+    main_gene_SYMBOL = regulon_SYMBOL[1]
+    
+    enrich_regulon = enrichGO_key_genes_all
+    enrich_regulon@result <- enrich_regulon@result[FALSE, ]
+    enrich_regulon@result$ONTOLOGY = NULL
+    enrich_regulon@ontology = "ALL"
+    enrich_regulon@gene = regulon_SYMBOL
+    enrich_regulon@universe = character(0)
+    enrich_regulon@geneSets = list()
+    
+    ### GO富集分析
+    enrichGO_regulon <- tryCatch(
+      enrichGO(gene = regulon_SYMBOL, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "ALL", minGSSize = 2, readable = TRUE, 
+               pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH"),
+      error = function(e) {message(e$message); return(NULL) }
+    )
+    if (!is.null(enrichGO_regulon)) {
+      enrichGO_regulon@result <- enrichGO_regulon@result[
+        grepl(main_gene_SYMBOL, enrichGO_regulon@result$geneID) & enrichGO_regulon@result$Count > 1, ]
+      if (nrow(enrichGO_regulon@result) > 0) {
+        enrichGO_regulon@result$ID = paste(enrichGO_regulon@result$ONTOLOGY, enrichGO_regulon@result$ID, sep = ".")
+        enrichGO_regulon@result$ONTOLOGY = NULL
+        enrich_regulon@result <- rbind(enrich_regulon@result, enrichGO_regulon@result)
+      }
+    }
+    
+    ### KEGG富集分析
+    enrichKEGG_regulon <- tryCatch(
+      enrichKEGG(gene = regulon_ENTREZID, keyType = "kegg", organism = "hsa", minGSSize = 2, use_internal_data = FALSE, 
+                 pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH"),
+      error = function(e) { message(e$message); return(NULL) }
+    )
+    if (!is.null(enrichKEGG_regulon)) {
+      enrichKEGG_regulon <- setReadable(enrichKEGG_regulon, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      enrichKEGG_regulon@result <- enrichKEGG_regulon@result[
+        grepl(main_gene_SYMBOL, enrichKEGG_regulon@result$geneID) & enrichKEGG_regulon@result$Count > 1, ]
+      if (nrow(enrichKEGG_regulon@result) > 0) {
+        enrichKEGG_regulon@result$ID = paste(
+          enrichKEGG_regulon@result$category, enrichKEGG_regulon@result$subcategory, enrichKEGG_regulon@result$ID, sep = ".")
+        enrichKEGG_regulon@result$category = NULL
+        enrichKEGG_regulon@result$subcategory = NULL
+        enrich_regulon@result <- rbind(enrich_regulon@result, enrichKEGG_regulon@result)
+      }
+    }
+    
+    ### KEGG模块富集分析
+    enrichMKEGG_regulon <- tryCatch(
+      enrichMKEGG(gene = regulon_ENTREZID, keyType = "kegg", organism = "hsa", minGSSize = 2, 
+                  pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH"),
+      error = function(e) { message(e$message); return(NULL) }
+    )
+    if (!is.null(enrichMKEGG_regulon)) {
+      enrichMKEGG_regulon <- setReadable(enrichMKEGG_regulon, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      enrichMKEGG_regulon@result <- enrichMKEGG_regulon@result[
+        grepl(main_gene_SYMBOL, enrichMKEGG_regulon@result$geneID) & enrichMKEGG_regulon@result$Count > 1, ]
+      if (nrow(enrichMKEGG_regulon@result) > 0) {
+        enrich_regulon@result <- rbind(enrich_regulon@result, enrichMKEGG_regulon@result)
+      }
+    }
+    
+    ### Pathway Commons富集分析，包括但不限于：通路数据库KEGG Pathway, Reactome, PANTHER Pathway, WikiPathways, NCI Pathway Interaction Database, NetPath；蛋白质相互作用(PPI)数据库BioGRID, HPRD, IntAct
+    enrichPC_regulon <- tryCatch(
+      enrichPC(gene = regulon_SYMBOL, minGSSize = 2, pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH"),
+      error = function(e) { message(e$message); return(NULL) }
+    )
+    if (!is.null(enrichPC_regulon)) {
+      enrichPC_regulon@result <- enrichPC_regulon@result[
+        grepl(main_gene_SYMBOL, enrichPC_regulon@result$geneID) & enrichPC_regulon@result$Count > 1, ]
+      if (nrow(enrichPC_regulon@result) > 0) {
+        enrich_regulon@result <- rbind(enrich_regulon@result, enrichPC_regulon@result)
+      }
+    }
+    
+    ### WikiPathways富集分析
+    enrichWP_regulon <- tryCatch(
+      # enrichWP(gene = regulon_ENTREZID, organism = "Homo sapiens", minGSSize = 2, pvalueCutoff = 0.05, qvalueCutoff = 0.2, pAdjustMethod = "BH"),
+      enricher(
+        gene = regulon_ENTREZID,
+        pvalueCutoff = 0.05,
+        pAdjustMethod = "BH",
+        minGSSize = 2,
+        qvalueCutoff = 0.2,
+        TERM2GENE = wp_gmt
+      ),
+      error = function(e) { message(e$message); return(NULL) }
+    )
+    if (!is.null(enrichWP_regulon)) {
+      enrichWP_regulon <- setReadable(enrichWP_regulon, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+      enrichWP_regulon@result <- enrichWP_regulon@result[
+        grepl(main_gene_SYMBOL, enrichWP_regulon@result$geneID) & enrichWP_regulon@result$Count > 1, ]
+      if (nrow(enrichWP_regulon@result) > 0) {
+        enrich_regulon@result <- rbind(enrich_regulon@result, enrichWP_regulon@result)
+      }
+    }
+    
+    Regulon_list[[regulon]][["enrich"]] = enrich_regulon
+    
+    if (direction == "up") {regulon_up_list = Regulon_list} else {regulon_down_list = Regulon_list}
+  }
+}; rm(Regulon_list, enrich_regulon)
+base::saveRDS(regulon_up_list, file = paste0("./Results/4 enrichment/", gsub(" ", "_", cell_type), "_regulon_up_list.rds"))
+base::saveRDS(regulon_down_list, file = paste0("./Results/4 enrichment/", gsub(" ", "_", cell_type), "_regulon_down_list.rds"))
+
+### 合并所有富集分析的结果
+enrich_regulons = list()
+for (direction in c("up", "down")) {
+  enrich__regulons = enrichGO_key_genes_all
+  enrich__regulons@result[, "regulon"] <- 0
+  enrich__regulons@result <- enrich__regulons@result[FALSE, ]
+  enrich__regulons@result$ONTOLOGY = NULL
+  enrich__regulons@ontology = "ALL"
+  enrich__regulons@gene = key_genes_all_SYMBOL
+  enrich__regulons@universe = character(0)
+  enrich__regulons@geneSets = list()
+  
+  if (direction == "up") {Regulon_list = regulon_up_list} else {Regulon_list = regulon_down_list}
+  
+  for (regulon in names(Regulon_list)) {
+    if (nrow(Regulon_list[[regulon]][["enrich"]]@result) > 0) {
+      Regulon_list[[regulon]][["enrich"]]@result[, "regulon"] = rep(regulon, nrow(Regulon_list[[regulon]][["enrich"]]@result))
+      enrich__regulons@result <- rbind(enrich__regulons@result, Regulon_list[[regulon]][["enrich"]]@result)
+    }
+  }
+  
+  enrich__regulons@result = enrich__regulons@result[, c("regulon", "ID", "Description", "GeneRatio", "BgRatio", "RichFactor", "FoldEnrichment", "zScore", "pvalue", "p.adjust", "qvalue", "geneID", "Count")]
+  enrich_regulons[[direction]] = enrich__regulons
+}; rm(enrich__regulons, Regulon_list)
+
+### 根据p值筛选结果
+enrich_regulons_filtered = enrich_regulons
+for (direction in c("up", "down")) {
+  if (nrow(enrich_regulons_filtered[[direction]]@result) > 0) {
+    enrich_regulons_filtered[[direction]]@result = na.omit(enrich_regulons_filtered[[direction]]@result)
+    enrich_regulons_filtered[[direction]]@result = enrich_regulons_filtered[[direction]]@result[
+      enrich_regulons_filtered[[direction]]@result$pvalue < 0.05 & 
+        enrich_regulons_filtered[[direction]]@result$p.adjust < 0.05 & 
+        enrich_regulons_filtered[[direction]]@result$qvalue < 0.05, , drop = F]
+    enrich_regulons_filtered[[direction]]@result <- enrich_regulons_filtered[[direction]]@result %>% 
+      arrange(desc(FoldEnrichment), desc(Count), qvalue)
+  }
+}
+
+print(rownames(enrich_regulons_filtered[["up"]]@result))
+print(rownames(enrich_regulons_filtered[["down"]]@result))
+
+
+##### 6.4 富集分析画图 #####
+### FoldEnrichment + p.adjust + count气泡图
+for (direction in c("up", "down")) {
+  if (nrow(enrich_regulons_filtered[[direction]]@result) > 0) {
+    enrich_regulons_filtered[[direction]]@result$logFoldEnrichment = log(enrich_regulons_filtered[[direction]]@result$FoldEnrichment)
+    dotplot_regulons_showCategory = nrow(enrich_regulons_filtered[[direction]]@result)
+    dotplot_regulons = dotplot(
+      enrich_regulons_filtered[[direction]], 
+      x = "logFoldEnrichment",
+      color = "qvalue",
+      size = "Count",
+      showCategory = dotplot_regulons_showCategory,
+      title = paste0(cell_type, " θ-", direction, " Regulons Enrichment Dotplot"),
+      label_format = 80
+    ) + theme(axis.text.y = element_text(size = 9), plot.title = element_text(hjust = 1))
+    print(dotplot_regulons)
+    ggsave(filename = paste0("./Results/4 enrichment/", gsub(" ", "_", cell_type), "_θ_", direction, "_Regulons_Enrichment_Dotplot.png"), plot = dotplot_regulons, 
+           width = 7, height = 0.2 * (dotplot_regulons_showCategory + 1) + ifelse(dotplot_regulons_showCategory == 1, 1, 0), limitsize = FALSE, dpi = 600)
+  }
+}; rm(dotplot_regulons)
+
+### 基因-通路热图
+width = 1:2; height = 1:2; angle = 1:2
+names(width) = c("up", "down"); names(height) = c("up", "down"); names(angle) = c("up", "down")
+if (cell_type == "CD14 Mono") {
+  width["up"] = 3.4 # (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix)
+  height["up"] = 1.5 # (nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1
+  width["down"] = 3.4 # (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix)
+  height["down"] = 8 # (nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1
+  angle["up"] = 0
+  angle["down"] = 15
+} else if (cell_type == "CD4 Naive") {
+  width["up"] = 3.55 # (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix)
+  height["up"] = 4.48 # 0.95 * ((nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1)
+  width["down"] = 3.55 # (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix)
+  height["down"] = 4.71 # (nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1
+  angle["up"] = 30
+  angle["down"] = 30
+} else if (cell_type == "CD8 Naive") {
+  width["up"] = 3.23 # 0.4 * (3.8 + (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.075 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix))
+  height["up"] = 4.89 # 1.35 * ((nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1.02)
+  width["down"] = 7.17 # 0.89 * (3.8 + (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.075 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix))
+  height["down"] = 2.98# 0.83 * ((nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1.02)
+  angle["up"] = 30
+  angle["down"] = 30
+} else if (cell_type == "CD4 TCM") {
+  width["up"] = 3.9 # (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix)
+  height["up"] = 3.3 # (nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1
+  width["down"] = 4.5 # (ncol(regulon_and_pathway_logical_matrix) + 1 + max(nchar(rownames(regulon_and_pathway_logical_matrix))) / 72 * 24 / 1.6) * 0.2 * 0.85 * 5 / ncol(regulon_and_pathway_logical_matrix)
+  height["down"] = 6 # (nrow(regulon_and_pathway_logical_matrix) + 3 + 1 + max(nchar(colnames(regulon_and_pathway_logical_matrix))) / 3.5) * 0.2 * 1
+  angle["up"] = 30
+  angle["down"] = 50
+}
+
+for (direction in c("up", "down")) {
+  if (nrow(enrich_regulons_filtered[[direction]]@result) > 0) {
+    
+    # 构造基因-通路关系矩阵
+    regulon_pathway_factor <- data.frame(
+      regulon = factor(enrich_regulons_filtered[[direction]]@result$regulon, levels = unique(enrich_regulons_filtered[[direction]]@result$regulon)),
+      ID = factor(enrich_regulons_filtered[[direction]]@result$ID, levels = unique(enrich_regulons_filtered[[direction]]@result$ID))
+    )
+    regulon_and_pathway_logical_matrix <- as.data.frame.matrix(table(regulon_pathway_factor$regulon, regulon_pathway_factor$ID) > 0)
+    regulon_and_pathway_logical_matrix = as.data.frame(t(regulon_and_pathway_logical_matrix))
+    regulon_and_pathway_logical_matrix = regulon_and_pathway_logical_matrix[, apply(regulon_and_pathway_logical_matrix, 2, any), drop = FALSE]
+    
+    # 为每个基因创建一个颜色类别向量
+    regulon_color_map <- case_when(
+      grepl("TG", enrich_regulons_filtered[[direction]]@result$regulon) ~ "Red",
+      grepl("TFG", enrich_regulons_filtered[[direction]]@result$regulon)  ~ "Blue",
+      TRUE ~ "Black"
+    )
+    names(regulon_color_map) <- enrich_regulons_filtered[[direction]]@result$regulon
+    
+    # 将逻辑矩阵转换为ggplot2适用的长格式
+    plot_data <- regulon_and_pathway_logical_matrix %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column(var = "Pathway") %>% # 通路描述作为一列
+      melt(id.vars = "Pathway", variable.name = "Regulon", value.name = "Present") %>%
+      filter(Present == TRUE) # 只保留存在关联的行（TRUE）
+    
+    # 将颜色映射信息添加到绘图数据中
+    plot_data <- plot_data %>%
+      mutate(Color_Category = regulon_color_map[as.character(Regulon)]) # 根据基因名匹配颜色类别
+    
+    # 绘制热图
+    heatplot_regulons = ggplot(
+      plot_data, aes(x = Regulon, y = Pathway)) +
+      geom_tile(aes(fill = Color_Category), color = "white", linewidth = 0.3) + # 使用颜色类别填充，并设置白色边框
+      scale_fill_manual(values = c("Red" = "red", "Blue" = "blue")) +
+      labs(
+        title = paste0(cell_type, " Association Heatmap"),
+        subtitle = paste0("Between θ-", direction, " Regulons And Enrichment Pathways"),
+        x = "Regulon",
+        y = "Pathway"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = angle[direction], hjust = 1, size = 9), 
+        axis.text.y = element_text(size = 8),
+        plot.title = element_text(hjust = 1, size = 12),
+        plot.subtitle = element_text(hjust = 1, size = 10), 
+        legend.position = "none"
+      )
+    print(heatplot_regulons)
+    ggsave(filename = paste0("./Results/4 enrichment/", cell_type, " Association Heatmap of θ-", direction," Regulons And Enrichment Pathways.png"), 
+           plot = heatplot_regulons, width = width[direction], height = height[direction], limitsize = FALSE, dpi = 600)
+    rm(regulon_color_map, plot_data)
+  }
+}
+
+save.image(paste0("./Results/4 enrichment/", cell_type, " Network plot and enrichcode6.4.RData"))
